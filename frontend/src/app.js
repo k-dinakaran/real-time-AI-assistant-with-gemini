@@ -33,11 +33,11 @@ function App() {
   }, [messages]);
 
   const connectWebSocket = () => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // ✅ Use .env variables instead of hardcoding
     const wsUrl =
       process.env.NODE_ENV === 'production'
-        ? `${protocol}//${window.location.host}/ws/assistant`
-        : 'ws://localhost:8000/ws/assistant';
+        ? process.env.REACT_APP_WS_URL_PROD
+        : process.env.REACT_APP_WS_URL_DEV;
 
     ws.current = new WebSocket(wsUrl);
 
