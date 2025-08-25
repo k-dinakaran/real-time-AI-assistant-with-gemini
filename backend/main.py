@@ -109,6 +109,8 @@ async def stream_gemini_response(session_id: str, user_message: str):
 @app.websocket("/ws/assistant")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()   # ✅ accept first
+    
+    session_id = None
     try:
         while True:
             data = await websocket.receive_text()
@@ -118,13 +120,17 @@ async def websocket_endpoint(websocket: WebSocket):
             user_message = message_data.get("user_message")
 
             if not session_id or not user_message:
+                # ✅ safe to send now, because accept() was already called
                 await websocket.send_text(json.dumps({
                     "type": "error",
                     "content": "Missing session_id or user_message"
                 }))
                 continue
 
+            # ✅ connect once session_id is available
             await manager.connect(websocket, session_id)
+
+            # Stream Gemini response
             await stream_gemini_response(session_id, user_message)
 
     except WebSocketDisconnect:
