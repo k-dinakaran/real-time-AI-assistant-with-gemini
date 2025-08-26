@@ -7,25 +7,29 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-# Load environment variables
+# ----------------- Load environment variables -----------------
 load_dotenv()
 
 app = FastAPI()
 
-# Configure CORS (React frontend runs on localhost:3000)
+# ----------------- Configure CORS -----------------
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure Gemini API
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_FALLBACK_KEY_HERE")
+# ----------------- Configure Gemini API -----------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY not set in environment")
 genai.configure(api_key=GEMINI_API_KEY)
 
-# In-memory session storage (use Redis or DB in production)
+# ----------------- In-memory session storage -----------------
 sessions: Dict[str, List[Dict]] = {}
 
 
@@ -162,6 +166,8 @@ def read_root():
     return {"message": "AI Assistant API is running 🚀"}
 
 
+# ----------------- Entrypoint -----------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True, proxy_headers=True)
