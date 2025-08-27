@@ -84,7 +84,7 @@ async def stream_gemini_response(session_id: str, user_message: str):
             })
 
         # Initialize model
-        model = genai.GenerativeModel("gemini-1.5-pro")
+        model = genai.GenerativeModel("gemini-2.0-flash")
 
         # Start chat with history
         chat = model.start_chat(history=formatted_history)
