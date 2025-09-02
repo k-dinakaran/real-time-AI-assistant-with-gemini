@@ -1,173 +1,220 @@
 import os
 import json
 import asyncio
-from typing import Dict, List
+from typing import Dict, Optional
 import google.generativeai as genai
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from passlib.context import CryptContext
+import jwt
+from datetime import datetime, timedelta
+import psycopg_pool
+import psycopg.rows
 
 # ----------------- Load environment variables -----------------
 load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey123")
 
+if not GEMINI_API_KEY or not DATABASE_URL:
+    raise ValueError("Missing required environment variables (GEMINI_API_KEY or DATABASE_URL)")
+
+# ----------------- Configure Gemini -----------------
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ----------------- App Setup -----------------
 app = FastAPI()
-
-# ----------------- Configure CORS -----------------
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
-
+origins = [
+    "http://localhost:3000",  # React dev
+    "http://localhost:5173",  # Vite dev
+    "https://real-time-ai-assistant-with-gemini.vercel.app",  # Vercel prod
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------- Configure Gemini API -----------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set in environment")
-genai.configure(api_key=GEMINI_API_KEY)
+# ----------------- Security -----------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# ----------------- In-memory session storage -----------------
-sessions: Dict[str, List[Dict]] = {}
+def create_access_token(subject: str, expires_delta: Optional[timedelta] = None) -> str:
+    expire = datetime.utcnow() + (expires_delta or timedelta(hours=1))
+    payload = {"sub": subject, "exp": int(expire.timestamp())}
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
-
-# ----------------- Connection Manager -----------------
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
-
-    async def connect(self, websocket: WebSocket, session_id: str):
-        self.active_connections[session_id] = websocket
-
-    def disconnect(self, session_id: str):
-        if session_id in self.active_connections:
-            del self.active_connections[session_id]
-
-    async def send_message(self, message: str, session_id: str):
-        if session_id in self.active_connections:
-            await self.active_connections[session_id].send_text(message)
-
-
-manager = ConnectionManager()
-
-
-# ----------------- Session Helpers -----------------
-def get_session_history(session_id: str) -> List[Dict]:
-    if session_id not in sessions:
-        sessions[session_id] = []
-    return sessions[session_id]
-
-
-def add_to_history(session_id: str, role: str, message: str):
-    if session_id not in sessions:
-        sessions[session_id] = []
-    sessions[session_id].append({"role": role, "message": message})
-
-
-# ----------------- Gemini Response Streaming -----------------
-async def stream_gemini_response(session_id: str, user_message: str):
+def decode_access_token(token: str) -> str:
     try:
-        # Get conversation history
-        history = get_session_history(session_id)
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload.get("sub")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-        # Add user message to history
-        add_to_history(session_id, "user", user_message)
+# ----------------- Database -----------------
+db_pool: psycopg_pool.AsyncConnectionPool = None
 
-        # Format history for Gemini
-        formatted_history = []
-        for msg in history:
-            formatted_history.append({
-                "role": "user" if msg["role"] == "user" else "model",
-                "parts": [msg["message"]]
-            })
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    db_pool = psycopg_pool.AsyncConnectionPool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        kwargs={"row_factory": psycopg.rows.dict_row}
+    )
 
-        # Initialize model
-        model = genai.GenerativeModel("gemini-2.0-flash")
+@app.on_event("shutdown")
+async def shutdown():
+    await db_pool.close()
 
-        # Start chat with history
-        chat = model.start_chat(history=formatted_history)
+# ----------------- Helpers -----------------
+async def get_user_by_email(email: str):
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+            return await cur.fetchone()
 
-        # Stream Gemini response
-        response = chat.send_message(user_message, stream=True)
+async def create_user(email: str, password: str):
+    hashed = pwd_context.hash(password)
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO users (email, password_hash) VALUES (%s, %s) RETURNING *",
+                (email, hashed),
+            )
+            return await cur.fetchone()
 
-        full_response = ""
-        for chunk in response:
-            chunk_text = chunk.text
-            full_response += chunk_text
+async def create_session(user_id: str, title: str = "New Chat"):
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO sessions (user_id, title) VALUES (%s, %s) RETURNING *",
+                (user_id, title),
+            )
+            return await cur.fetchone()
 
-            # Send chunks to client
-            await manager.send_message(json.dumps({
-                "type": "chunk",
-                "content": chunk_text
-            }), session_id)
+async def list_sessions(user_id: str):
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT * FROM sessions WHERE user_id=%s ORDER BY created_at DESC",
+                (user_id,),
+            )
+            return await cur.fetchall()
 
-            await asyncio.sleep(0.01)  # simulate streaming effect
+async def get_session_messages(session_id: str):
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT * FROM messages WHERE session_id=%s ORDER BY created_at ASC",
+                (session_id,),
+            )
+            return await cur.fetchall()
 
-        # Add AI response to history
-        add_to_history(session_id, "assistant", full_response)
+async def persist_message(session_id: str, role: str, content: str):
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (%s, %s, %s) RETURNING *",
+                (session_id, role, content),
+            )
+            msg = await cur.fetchone()
+    if role == "user":
+        await update_session_title(session_id, content)
+    return msg
 
-        # Final complete response
-        await manager.send_message(json.dumps({
-            "type": "complete",
-            "content": full_response
-        }), session_id)
+async def update_session_title(session_id: str, content: str):
+    snippet = content[:30]
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("UPDATE sessions SET title=%s WHERE id=%s", (snippet, session_id))
 
-    except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        await manager.send_message(json.dumps({
-            "type": "error",
-            "content": error_msg
-        }), session_id)
+# ----------------- REST Auth -----------------
+@app.post("/signup")
+async def signup(data: Dict):
+    email, password = data.get("email"), data.get("password")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Missing email or password")
+    if await get_user_by_email(email):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = await create_user(email, password)
+    token = create_access_token(str(user["id"]))
+    return {"access_token": token, "user_id": str(user["id"])}
 
+@app.post("/login")
+async def login(data: Dict):
+    email, password = data.get("email"), data.get("password")
+    user = await get_user_by_email(email)
+    if not user or not pwd_context.verify(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(str(user["id"]))
+    return {"access_token": token, "user_id": str(user["id"])}
 
-# ----------------- WebSocket Endpoint -----------------
-@app.websocket("/ws/assistant")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()   # accept connection once
+@app.get("/sessions")
+async def get_sessions(request: Request):
+    token = request.headers.get("Authorization")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    user_id = decode_access_token(token.replace("Bearer ", ""))
+    sessions = await list_sessions(user_id)
+    return [dict(s) for s in sessions]
 
-    session_id = None
+@app.post("/sessions")
+async def new_session(request: Request):
+    token = request.headers.get("Authorization")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    user_id = decode_access_token(token.replace("Bearer ", ""))
+    session = await create_session(user_id)
+    return dict(session)
+
+# ----------------- WebSocket Chat -----------------
+@app.websocket("/ws/chat")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+
     try:
         while True:
-            data = await websocket.receive_text()
-            message_data = json.loads(data)
+            data = await ws.receive_text()
+            payload = json.loads(data)
 
-            session_id = message_data.get("session_id")
-            user_message = message_data.get("user_message")
-
-            if not session_id or not user_message:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "content": "Missing session_id or user_message"
-                }))
+            if payload["type"] == "auth":
+                token = payload.get("token")
+                user_id = decode_access_token(token)
+                session = await create_session(user_id)
+                session_id = str(session["id"])
+                await ws.send_text(json.dumps({"type": "session_started", "session_id": session_id}))
                 continue
 
-            # Register client session
-            await manager.connect(websocket, session_id)
+            if payload["type"] == "message" and session_id:
+                msg_text = payload["content"]
+                await persist_message(session_id, "user", msg_text)
 
-            # Process and stream AI response
-            await stream_gemini_response(session_id, user_message)
+                past_msgs = await get_session_messages(session_id)
+                history = [{"role": m["role"], "parts": [m["content"]]} for m in past_msgs]
+
+                model = genai.GenerativeModel("gemini-1.5-flash", system_instruction="You are a helpful assistant.")
+                chat = model.start_chat(history=history)
+                response = await asyncio.to_thread(chat.send_message, msg_text)
+
+                reply = response.text
+                await persist_message(session_id, "assistant", reply)
+                await ws.send_text(json.dumps({"type": "assistant", "content": reply}))
 
     except WebSocketDisconnect:
-        if session_id:
-            manager.disconnect(session_id)
+        print("WebSocket disconnected")
     except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        await websocket.send_text(json.dumps({
-            "type": "error",
-            "content": error_msg
-        }))
-
+        await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
 
 # ----------------- Health Check -----------------
 @app.get("/")
-def read_root():
-    return {"message": "AI Assistant API is running 🚀"}
-
-
-# ----------------- Entrypoint -----------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True, proxy_headers=True)
+async def health():
+    return {"status": "ok", "message": "Backend is running"}
